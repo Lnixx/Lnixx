@@ -40,6 +40,60 @@ db.exec(`
   );
 `);
 
+function addColumnIfMissing(table: string, column: string, definition: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+// Where the booking came from: the web form or the front-desk agent.
+addColumnIfMissing("bookings", "source", "TEXT NOT NULL DEFAULT 'web'");
+addColumnIfMissing("bookings", "conversationId", "TEXT");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    providerId INTEGER NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+    updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (providerId) REFERENCES providers(id)
+  );
+
+  -- One row per API message. "content" is the JSON content exactly as sent to
+  -- or received from the model, so a conversation can be replayed unchanged.
+  CREATE TABLE IF NOT EXISTS conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversationId TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (conversationId) REFERENCES conversations(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON conversation_messages (conversationId, id);
+
+  -- Questions the agent could not answer and passed to the provider.
+  CREATE TABLE IF NOT EXISTS handoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    providerId INTEGER NOT NULL,
+    conversationId TEXT NOT NULL,
+    question TEXT NOT NULL,
+    customerName TEXT,
+    customerPhone TEXT,
+    createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+try {
+  // Two bookings can never hold the same slot, even if requests race.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_slot ON bookings (providerId, date, time)",
+  );
+} catch {
+  // An older database already holds duplicate slots; keep running without the index.
+}
+
 export type Provider = {
   id: number;
   name: string;
@@ -109,9 +163,15 @@ export type Booking = {
   time: string;
   note: string | null;
   status: string;
+  source: string;
+  conversationId: string | null;
   createdAt: string;
 };
 
+/**
+ * Creates a booking. Throws if the slot is already held (unique index), so
+ * callers should check `isSlotTaken` first and still handle the error.
+ */
 export function createBooking(input: {
   providerId: number;
   customerName: string;
@@ -119,13 +179,126 @@ export function createBooking(input: {
   date: string;
   time: string;
   note?: string;
+  status?: "paid" | "reserved";
+  source?: "web" | "agent";
+  conversationId?: string;
 }): number {
   const stmt = db.prepare(`
-    INSERT INTO bookings (providerId, customerName, customerPhone, date, time, note, status)
-    VALUES (@providerId, @customerName, @customerPhone, @date, @time, @note, 'paid')
+    INSERT INTO bookings
+      (providerId, customerName, customerPhone, date, time, note, status, source, conversationId)
+    VALUES
+      (@providerId, @customerName, @customerPhone, @date, @time, @note, @status, @source, @conversationId)
   `);
-  const result = stmt.run({ ...input, note: input.note ?? null });
+  const result = stmt.run({
+    ...input,
+    note: input.note ?? null,
+    status: input.status ?? "paid",
+    source: input.source ?? "web",
+    conversationId: input.conversationId ?? null,
+  });
   return Number(result.lastInsertRowid);
+}
+
+export function getTakenTimes(providerId: number, date: string): string[] {
+  const rows = db
+    .prepare("SELECT time FROM bookings WHERE providerId = ? AND date = ?")
+    .all(providerId, date) as { time: string }[];
+  return rows.map((r) => r.time);
+}
+
+export function getBookingsForProvider(providerId: number): Booking[] {
+  return db
+    .prepare("SELECT * FROM bookings WHERE providerId = ? ORDER BY date DESC, time DESC LIMIT 100")
+    .all(providerId) as Booking[];
+}
+
+export function countAgentBookings(conversationId: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS c FROM bookings WHERE conversationId = ?")
+    .get(conversationId) as { c: number };
+  return row.c;
+}
+
+// ---- Agent conversations ----
+
+export type Conversation = {
+  id: string;
+  providerId: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type StoredMessage = { role: "user" | "assistant"; content: unknown };
+
+export function getConversation(id: string): Conversation | undefined {
+  return db.prepare("SELECT * FROM conversations WHERE id = ?").get(id) as
+    | Conversation
+    | undefined;
+}
+
+export function createConversation(id: string, providerId: number): void {
+  db.prepare("INSERT INTO conversations (id, providerId) VALUES (?, ?)").run(id, providerId);
+}
+
+export function getConversationMessages(conversationId: string): StoredMessage[] {
+  const rows = db
+    .prepare("SELECT role, content FROM conversation_messages WHERE conversationId = ? ORDER BY id")
+    .all(conversationId) as { role: "user" | "assistant"; content: string }[];
+  return rows.map((r) => ({ role: r.role, content: JSON.parse(r.content) }));
+}
+
+export const appendConversationMessages = db.transaction(
+  (conversationId: string, messages: StoredMessage[]) => {
+    const insert = db.prepare(
+      "INSERT INTO conversation_messages (conversationId, role, content) VALUES (?, ?, ?)",
+    );
+    for (const m of messages) insert.run(conversationId, m.role, JSON.stringify(m.content));
+    db.prepare("UPDATE conversations SET updatedAt = datetime('now') WHERE id = ?").run(
+      conversationId,
+    );
+  },
+);
+
+export function getConversationsForProvider(providerId: number): Conversation[] {
+  return db
+    .prepare("SELECT * FROM conversations WHERE providerId = ? ORDER BY updatedAt DESC LIMIT 50")
+    .all(providerId) as Conversation[];
+}
+
+export type Handoff = {
+  id: number;
+  providerId: number;
+  conversationId: string;
+  question: string;
+  customerName: string | null;
+  customerPhone: string | null;
+  createdAt: string;
+};
+
+export function createHandoff(input: {
+  providerId: number;
+  conversationId: string;
+  question: string;
+  customerName?: string;
+  customerPhone?: string;
+}): number {
+  const result = db
+    .prepare(
+      `INSERT INTO handoffs (providerId, conversationId, question, customerName, customerPhone)
+       VALUES (@providerId, @conversationId, @question, @customerName, @customerPhone)`,
+    )
+    .run({
+      ...input,
+      customerName: input.customerName ?? null,
+      customerPhone: input.customerPhone ?? null,
+    });
+  return Number(result.lastInsertRowid);
+}
+
+export function getHandoffsForProvider(providerId: number): Handoff[] {
+  return db
+    .prepare("SELECT * FROM handoffs WHERE providerId = ? ORDER BY id DESC LIMIT 100")
+    .all(providerId) as Handoff[];
 }
 
 export function getBookingById(id: number): Booking | undefined {

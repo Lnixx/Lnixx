@@ -26,14 +26,19 @@ export async function bookAppointment(
     return { error: "That time slot was just booked by someone else. Pick another." };
   }
 
-  const bookingId = createBooking({
-    providerId,
-    customerName,
-    customerPhone,
-    date,
-    time,
-    note: note || undefined,
-  });
+  let bookingId: number;
+  try {
+    bookingId = createBooking({
+      providerId,
+      customerName,
+      customerPhone,
+      date,
+      time,
+      note: note || undefined,
+    });
+  } catch {
+    return { error: "That time slot was just booked by someone else. Pick another." };
+  }
 
   redirect(`/book/${providerId}/confirmation/${bookingId}`);
 }

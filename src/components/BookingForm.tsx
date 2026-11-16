@@ -2,18 +2,8 @@
 
 import { useActionState, useState } from "react";
 import { bookAppointment, type FormState } from "@/lib/actions";
+import { TIMES } from "@/lib/slots";
 
-const TIMES = [
-  "09:00",
-  "10:00",
-  "11:00",
-  "12:00",
-  "13:00",
-  "14:00",
-  "15:00",
-  "16:00",
-  "17:00",
-];
 
 function nextDays(count: number) {
   const days = [];

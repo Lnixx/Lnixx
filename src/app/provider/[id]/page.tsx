@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getProviderById } from "@/lib/db";
 import { getCategory } from "@/lib/categories";
 import StarRating from "@/components/StarRating";
+import AgentChat from "@/components/AgentChat";
 
 export default async function ProviderPage({
   params,
@@ -55,6 +56,10 @@ export default async function ProviderPage({
             Book Now
           </Link>
         </div>
+      </div>
+
+      <div className="mt-10">
+        <AgentChat providerId={provider.id} providerName={provider.name} />
       </div>
 
       <div className="mt-10">
